@@ -1,0 +1,9 @@
+[Unit]
+Description=Check public IP and email if off VPN
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpn-ipwatch
+StateDirectory=vpn-ipwatch

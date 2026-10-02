@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# vpn-ipwatch - email an alert when your public IP leaves the VPN.
+# https://github.com/<you>/vpn-ipwatch   (MIT License)
+set -uo pipefail
+
+CONFIG="${VPN_IPWATCH_CONFIG:-/etc/vpn-ipwatch.conf}"
+
+# ---- defaults (override in $CONFIG) ----
+EMAIL_TO=""
+EMAIL_FROM="vpn-ipwatch@$(hostname -f 2>/dev/null || hostname)"
+VPN_INTERFACE=""          # e.g. tun0, wg0, proton0 - blank = don't check
+VPN_ORG_MATCH=""          # regex the VPN's ASN/org must match, e.g. "Mullvad|M247|Datacamp"
+ISP_ORG_MATCH=""          # regex for your real ISP, e.g. "Comcast|AT&T"
+TRUSTED_IPS=""            # space-separated IPs that count as "on VPN" (e.g. a dedicated VPN IP)
+ALERT_ON_ANY_CHANGE=0     # 1 = also email on every IP change, even while on the VPN
+STATE_DIR="/var/lib/vpn-ipwatch"
+IP_SERVICES="https://api.ipify.org https://icanhazip.com https://ifconfig.me/ip https://checkip.amazonaws.com"
+ORG_SERVICE="https://ipinfo.io"   # returns JSON with an "org" field
+CURL_TIMEOUT=8
+
+# shellcheck source=/dev/null
+[[ -r "$CONFIG" ]] && . "$CONFIG"
+
+log() { logger -t vpn-ipwatch -- "$*" 2>/dev/null; echo "$(date '+%F %T') $*"; }
+
+get_public_ip() {
+  local svc ip
+  for svc in $IP_SERVICES; do
+    ip=$(curl -fsS -4 --max-time "$CURL_TIMEOUT" "$svc" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then echo "$ip"; return 0; fi
+  done
+  return 1
+}
+
+get_org() {
+  curl -fsS --max-time "$CURL_TIMEOUT" "$ORG_SERVICE/$1/json" 2>/dev/null \
+    | sed -n 's/.*"org"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+}
+
+iface_up() {
+  [[ -z "$VPN_INTERFACE" ]] && return 0
+  ip link show "$VPN_INTERFACE" >/dev/null 2>&1 || return 1
+  # WireGuard/tun often report state UNKNOWN while working, so only treat DOWN as down
+  ! ip link show "$VPN_INTERFACE" | grep -q 'state DOWN'
+}
+
+send_mail() {
+  local subject="$1" body="$2"
+  if [[ -z "$EMAIL_TO" ]]; then log "EMAIL_TO not set; would have sent: $subject"; return 1; fi
+  local mailer
+  mailer=$(command -v msmtp || command -v sendmail || true)
+  if [[ -z "$mailer" ]]; then log "No msmtp/sendmail found; cannot send: $subject"; return 1; fi
+  printf 'To: %s\nFrom: %s\nSubject: %s\nDate: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s\n' \
+    "$EMAIL_TO" "$EMAIL_FROM" "$subject" "$(date -R)" "$body" | "$mailer" -t
+}
+
+# Returns 0 if we believe traffic is going through the VPN. Sets REASON.
+on_vpn() {
+  local ip="$1" org="$2"
+  REASON=""
+  if ! iface_up; then REASON="VPN interface '$VPN_INTERFACE' is down/missing"; return 1; fi
+  for t in $TRUSTED_IPS; do [[ "$ip" == "$t" ]] && return 0; done
+  if [[ -n "$ISP_ORG_MATCH" && "$org" =~ $ISP_ORG_MATCH ]]; then
+    REASON="public IP belongs to your ISP ($org)"; return 1
+  fi
+  if [[ -n "$VPN_ORG_MATCH" && ! "$org" =~ $VPN_ORG_MATCH ]]; then
+    REASON="public IP org '$org' does not match VPN_ORG_MATCH"; return 1
+  fi
+  return 0
+}
+
+main() {
+  mkdir -p "$STATE_DIR"
+  local state="$STATE_DIR/state" last_ip="" last_status=""
+  # shellcheck source=/dev/null
+  [[ -r "$state" ]] && . "$state"
+
+  local ip org status
+  if ! ip=$(get_public_ip); then
+    log "Could not determine public IP (offline?)"; exit 0
+  fi
+  org=$(get_org "$ip"); org=${org:-unknown}
+
+  if on_vpn "$ip" "$org"; then status="VPN"; else status="OFF-VPN"; fi
+
+  local host; host=$(hostname)
+  local details
+  details=$(printf 'Host:        %s\nTime:        %s\nPublic IP:   %s (was %s)\nNetwork/org: %s\nStatus:      %s\nReason:      %s\n' \
+    "$host" "$(date)" "$ip" "${last_ip:-none}" "$org" "$status" "${REASON:-n/a}")
+
+  if [[ "$status" == "OFF-VPN" && "$last_status" != "OFF-VPN" ]]; then
+    log "ALERT: off VPN - $ip ($org): $REASON"
+    send_mail "[vpn-ipwatch] $host is OFF the VPN ($ip)" "$details"
+  elif [[ "$status" == "VPN" && "$last_status" == "OFF-VPN" ]]; then
+    log "Recovered: back on VPN - $ip ($org)"
+    send_mail "[vpn-ipwatch] $host is back on the VPN ($ip)" "$details"
+  elif [[ "$ip" != "$last_ip" && -n "$last_ip" && "$ALERT_ON_ANY_CHANGE" == 1 ]]; then
+    log "IP changed: $last_ip -> $ip ($org)"
+    send_mail "[vpn-ipwatch] $host IP changed to $ip" "$details"
+  elif [[ "$ip" != "$last_ip" ]]; then
+    log "IP now $ip ($org) status=$status"
+  fi
+
+  printf 'last_ip=%q\nlast_status=%q\n' "$ip" "$status" > "$state"
+}
+
+case "${1:-}" in
+  --test-email) send_mail "[vpn-ipwatch] test from $(hostname)" "If you can read this, email alerts work." && echo "Sent." ;;
+  --status)
+    ip=$(get_public_ip) || { echo "No public IP"; exit 1; }
+    org=$(get_org "$ip")
+    if on_vpn "$ip" "$org"; then echo "ON VPN: $ip ($org)"; else echo "OFF VPN: $ip ($org) - $REASON"; fi ;;
+  -h|--help) echo "Usage: vpn-ipwatch [--status|--test-email]   (no args = run one check)" ;;
+  *) main ;;
+esac

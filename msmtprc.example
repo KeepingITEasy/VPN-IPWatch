@@ -1,0 +1,16 @@
+# /etc/msmtprc  (chmod 600, owned by root)
+# Example for Gmail / Google Workspace - needs an App Password
+# (Google Account > Security > 2-Step Verification > App passwords).
+# For Microsoft 365 use host smtp.office365.com, port 587 (SMTP AUTH must be enabled for the mailbox).
+defaults
+auth           on
+tls            on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        /var/log/msmtp.log
+
+account        default
+host           smtp.gmail.com
+port           587
+from           you@gmail.com
+user           you@gmail.com
+password       your-16-char-app-password
