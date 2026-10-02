@@ -13,7 +13,7 @@ You get one email when the status changes to OFF-VPN and one when it recovers, s
 ## Install
 
 ```bash
-git clone https://github.com/<you>/vpn-ipwatch.git
+git clone ttps://github.com/<you>/vpn-ipwatch.git](https://github.com/KeepingITEasy/VPN-IPWatch.git
 cd vpn-ipwatch
 sudo bash install.sh
 ```
