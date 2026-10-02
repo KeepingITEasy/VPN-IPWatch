@@ -1,0 +1,3 @@
+# Never commit real credentials
+msmtprc
+*.local
