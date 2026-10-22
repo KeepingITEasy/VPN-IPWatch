@@ -117,6 +117,8 @@ sudo chmod 755 /usr/local/sbin/fix-vpn.sh
 sudo vi /usr/local/sbin/fix-vpn.sh
 ```
 
+**PIA with manual-connections (WireGuard):** use `fix-pia-manual-connections.sh` instead. It reads your PIA login from `/etc/pia-credentials` (chmod 600), reconnects, and confirms the VPN is up. Setup steps are at the top of the file. Set `FIX_TIMEOUT=180`, since the PIA setup can take a minute.
+
 Point the config at it (the script can live anywhere):
 
 ```
