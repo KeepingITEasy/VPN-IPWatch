@@ -10,7 +10,16 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl iproute2 msmtp msmtp-
  
 echo ">> Installing script to /usr/local/bin/vpn-ipwatch"
 install -m 0755 vpn-ipwatch /usr/local/bin/vpn-ipwatch
- 
+install -d -m 0755 /usr/local/share/vpn-ipwatch
+install -m 0644 fix-vpn.example.sh /usr/local/share/vpn-ipwatch/fix-vpn.example.sh
+echo ">> Example fix script: /usr/local/share/vpn-ipwatch/fix-vpn.example.sh"
+
+if [[ -e /etc/vpn-ipwatch.conf ]] && ! grep -q '^FIX_SCRIPT=' /etc/vpn-ipwatch.conf; then
+  # Upgrading from v2: add the new settings to the existing config, untouched otherwise.
+  sed -n '/^# ---- Auto-fix ----/,$p' vpn-ipwatch.conf | { echo; cat; } >> /etc/vpn-ipwatch.conf
+  echo ">> Added auto-fix and kill switch settings to /etc/vpn-ipwatch.conf"
+fi
+
 if [[ -e /etc/vpn-ipwatch.conf ]]; then
   echo ">> Keeping existing /etc/vpn-ipwatch.conf"
 else
@@ -42,4 +51,6 @@ cat <<'EOF'
    2. sudo vi /etc/vpn-ipwatch.conf  (EMAIL_TO, VPN_INTERFACE, ISP_ORG_MATCH)
    3. sudo vpn-ipwatch --test-email
    4. vpn-ipwatch --status
+   5. Optional: set FIX_SCRIPT and KILL_SWITCH_CONTAINERS in /etc/vpn-ipwatch.conf,
+      then: sudo vpn-ipwatch --test-fix
 EOF
