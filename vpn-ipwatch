@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# vpn-ipwatch - email an alert when your public IP leaves the VPN.
-# https://github.com/<you>/vpn-ipwatch   (MIT License)
+# vpn-ipwatch - email an alert when your public IP leaves the VPN, run a fix
+# script to bring it back, and pause chosen Docker containers until it's back.
+# https://github.com/KeepingITEasy/vpn-ipwatch   (MIT License)
 set -uo pipefail
 
 CONFIG="${VPN_IPWATCH_CONFIG:-/etc/vpn-ipwatch.conf}"
@@ -18,8 +19,20 @@ IP_SERVICES="https://api.ipify.org https://icanhazip.com https://ifconfig.me/ip 
 ORG_SERVICE="https://ipinfo.io"   # returns JSON with an "org" field
 CURL_TIMEOUT=8
 
+# Auto-fix: script to run as soon as the VPN is found to be off (blank = none)
+FIX_SCRIPT=""
+FIX_TIMEOUT=120           # seconds before the fix script is stopped
+FIX_RETRY_INTERVAL=300    # while still off, run the fix again at most this often (seconds)
+FIX_WAIT=15               # seconds to wait after the fix before re-checking
+FIX_WHEN_OFFLINE=0        # 1 = also run the fix when there's no internet but the adapter looks up
+
+# Kill switch: Docker containers to pause while off the VPN or offline (space-separated)
+KILL_SWITCH_CONTAINERS=""
+
 # shellcheck source=/dev/null
 [[ -r "$CONFIG" ]] && . "$CONFIG"
+
+PAUSED_FILE="$STATE_DIR/paused-containers"
 
 log() { logger -t vpn-ipwatch -- "$*" 2>/dev/null; echo "$(date '+%F %T') $*"; }
 
@@ -69,47 +82,211 @@ on_vpn() {
   return 0
 }
 
+# Sets IP, ORG, STATUS (VPN | OFF-VPN | OFFLINE) and REASON.
+check_status() {
+  IP="" ORG="" REASON=""
+  if ! IP=$(get_public_ip); then
+    IP=""
+    if ! iface_up; then
+      STATUS="OFF-VPN"; REASON="VPN interface '$VPN_INTERFACE' is down/missing and there is no internet"
+    else
+      STATUS="OFFLINE"; REASON="could not determine public IP (no internet?)"
+    fi
+    return
+  fi
+  ORG=$(get_org "$IP"); ORG=${ORG:-unknown}
+  if on_vpn "$IP" "$ORG"; then STATUS="VPN"; else STATUS="OFF-VPN"; fi
+}
+
+# ---- kill switch ----
+
+docker_ok() {
+  [[ -n "$KILL_SWITCH_CONTAINERS" ]] || return 1
+  if ! command -v docker >/dev/null 2>&1; then
+    log "KILL_SWITCH_CONTAINERS is set but docker is not installed"; return 1
+  fi
+}
+
+container_state() { docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null; }
+
+paused_by_us() { [[ -f "$PAUSED_FILE" ]] && grep -qxF -- "$1" "$PAUSED_FILE"; }
+
+# Pause every listed container that's running. Only containers paused here are
+# recorded, so ones you paused yourself are never unpaused by vpn-ipwatch.
+# Safe to call on every check: containers that start during an outage get paused too.
+engage_kill_switch() {
+  docker_ok || return 0
+  local c st
+  for c in ${KILL_SWITCH_CONTAINERS//,/ }; do
+    st=$(container_state "$c") || { log "Kill switch: container '$c' not found"; continue; }
+    if [[ "$st" == "running" ]]; then
+      if docker pause "$c" >/dev/null 2>&1; then
+        paused_by_us "$c" || echo "$c" >> "$PAUSED_FILE"
+        log "Kill switch: paused $c"
+        PAUSED_NOW+=("$c")
+      else
+        log "Kill switch: FAILED to pause $c"
+      fi
+    fi
+  done
+}
+
+# Unpause only the containers this script paused.
+release_kill_switch() {
+  [[ -s "$PAUSED_FILE" ]] || return 0
+  command -v docker >/dev/null 2>&1 || { log "Cannot unpause: docker is not installed"; return 1; }
+  local c st keep=() resumed=()
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    st=$(container_state "$c") || { log "Kill switch: $c no longer exists, forgetting it"; continue; }
+    if [[ "$st" == "paused" ]]; then
+      if docker unpause "$c" >/dev/null 2>&1; then
+        resumed+=("$c")
+      else
+        log "Kill switch: FAILED to unpause $c (will retry)"; keep+=("$c")
+      fi
+    fi
+  done < "$PAUSED_FILE"
+  if ((${#keep[@]})); then printf '%s\n' "${keep[@]}" > "$PAUSED_FILE"; else rm -f "$PAUSED_FILE"; fi
+  if ((${#resumed[@]})); then log "Kill switch: unpaused ${resumed[*]}"; fi
+  RESUMED=("${resumed[@]}")
+}
+
+paused_list() { [[ -s "$PAUSED_FILE" ]] && tr '\n' ' ' < "$PAUSED_FILE" | sed 's/ $//'; }
+
+# ---- auto-fix ----
+
+run_fix() {
+  FIX_RESULT=""
+  [[ -n "$FIX_SCRIPT" ]] || return 1
+  if [[ ! -f "$FIX_SCRIPT" ]]; then FIX_RESULT="fix script not found: $FIX_SCRIPT"; log "$FIX_RESULT"; return 1; fi
+  if [[ ! -x "$FIX_SCRIPT" ]]; then FIX_RESULT="fix script is not executable (chmod +x $FIX_SCRIPT)"; log "$FIX_RESULT"; return 1; fi
+  # It runs as root, so refuse a script anyone else could edit.
+  if [[ -n "$(find "$FIX_SCRIPT" -perm /022 2>/dev/null)" ]]; then
+    FIX_RESULT="fix script is group/world-writable, refusing to run it (chmod 755 $FIX_SCRIPT)"; log "$FIX_RESULT"; return 1
+  fi
+  log "Running fix script: $FIX_SCRIPT"
+  local out rc
+  out=$(VPN_IPWATCH_REASON="$REASON" VPN_IPWATCH_IP="$IP" VPN_IPWATCH_STATUS="$STATUS" \
+        timeout "$FIX_TIMEOUT" "$FIX_SCRIPT" 2>&1); rc=$?
+  [[ -n "$out" ]] && while IFS= read -r line; do log "  fix: $line"; done <<< "$out"
+  date +%s > "$STATE_DIR/last-fix"
+  if ((rc == 124)); then FIX_RESULT="fix script timed out after ${FIX_TIMEOUT}s"
+  else FIX_RESULT="fix script exited with code $rc"; fi
+  log "$FIX_RESULT"
+  return 0
+}
+
+fix_due() {
+  [[ -n "$FIX_SCRIPT" ]] || return 1
+  [[ "$1" == "first" ]] && return 0
+  local last=0; [[ -r "$STATE_DIR/last-fix" ]] && last=$(<"$STATE_DIR/last-fix")
+  (( $(date +%s) - last >= FIX_RETRY_INTERVAL ))
+}
+
+# ---- main check ----
+
 main() {
   mkdir -p "$STATE_DIR"
   local state="$STATE_DIR/state" last_ip="" last_status=""
   # shellcheck source=/dev/null
   [[ -r "$state" ]] && . "$state"
 
-  local ip org status
-  if ! ip=$(get_public_ip); then
-    log "Could not determine public IP (offline?)"; exit 0
-  fi
-  org=$(get_org "$ip"); org=${org:-unknown}
+  PAUSED_NOW=() RESUMED=() FIX_RESULT=""
+  check_status
 
-  if on_vpn "$ip" "$org"; then status="VPN"; else status="OFF-VPN"; fi
+  local first_drop=0 wants_fix=0
+  if [[ "$STATUS" != "VPN" ]]; then
+    # Stop traffic first, then try to repair.
+    engage_kill_switch
+    [[ "$last_status" != "OFF-VPN" && "$last_status" != "OFFLINE" ]] && first_drop=1
+    [[ "$STATUS" == "OFF-VPN" || "$FIX_WHEN_OFFLINE" == 1 ]] && wants_fix=1
+    if ((wants_fix)) && fix_due "$( ((first_drop)) && echo first)"; then
+      local before_reason="$REASON"
+      run_fix
+      sleep "$FIX_WAIT"
+      check_status
+      if [[ "$STATUS" == "VPN" ]]; then
+        log "Auto-fix worked: back on VPN - $IP ($ORG)"
+        REASON="was: $before_reason"
+      else
+        log "Still not on the VPN after the fix: $REASON"
+        engage_kill_switch
+      fi
+    fi
+  fi
+
+  [[ "$STATUS" == "VPN" ]] && release_kill_switch
 
   local host; host=$(hostname)
   local details
   details=$(printf 'Host:        %s\nTime:        %s\nPublic IP:   %s (was %s)\nNetwork/org: %s\nStatus:      %s\nReason:      %s\n' \
-    "$host" "$(date)" "$ip" "${last_ip:-none}" "$org" "$status" "${REASON:-n/a}")
+    "$host" "$(date)" "${IP:-none}" "${last_ip:-none}" "${ORG:-n/a}" "$STATUS" "${REASON:-n/a}")
+  [[ -n "$FIX_RESULT" ]] && details+=$'\n'"Auto-fix:    $FIX_SCRIPT ($FIX_RESULT)"
+  ((${#PAUSED_NOW[@]})) && details+=$'\n'"Paused:      ${PAUSED_NOW[*]}"
+  ((${#RESUMED[@]}))   && details+=$'\n'"Unpaused:    ${RESUMED[*]}"
+  local still; still=$(paused_list)
+  [[ -n "$still" ]] && details+=$'\n'"Still paused: $still"
 
-  if [[ "$status" == "OFF-VPN" && "$last_status" != "OFF-VPN" ]]; then
-    log "ALERT: off VPN - $ip ($org): $REASON"
-    send_mail "[vpn-ipwatch] $host is OFF the VPN ($ip)" "$details"
-  elif [[ "$status" == "VPN" && "$last_status" == "OFF-VPN" ]]; then
-    log "Recovered: back on VPN - $ip ($org)"
-    send_mail "[vpn-ipwatch] $host is back on the VPN ($ip)" "$details"
-  elif [[ "$ip" != "$last_ip" && -n "$last_ip" && "$ALERT_ON_ANY_CHANGE" == 1 ]]; then
-    log "IP changed: $last_ip -> $ip ($org)"
-    send_mail "[vpn-ipwatch] $host IP changed to $ip" "$details"
-  elif [[ "$ip" != "$last_ip" ]]; then
-    log "IP now $ip ($org) status=$status"
+  local fixed_now=0
+  [[ "$STATUS" == "VPN" && -n "$FIX_RESULT" ]] && fixed_now=1
+
+  if [[ "$STATUS" == "OFF-VPN" && "$last_status" != "OFF-VPN" ]]; then
+    log "ALERT: off VPN - ${IP:-no IP} (${ORG:-n/a}): $REASON"
+    send_mail "[vpn-ipwatch] $host is OFF the VPN (${IP:-no internet})" "$details"
+  elif [[ "$STATUS" == "OFFLINE" && "$last_status" != "OFFLINE" && "$last_status" != "OFF-VPN" ]]; then
+    log "Offline: $REASON${still:+ - paused: $still}"
+  elif [[ "$STATUS" == "VPN" && "$last_status" == "OFF-VPN" ]]; then
+    log "Recovered: back on VPN - $IP ($ORG)"
+    send_mail "[vpn-ipwatch] $host is back on the VPN ($IP)" "$details"
+  elif ((fixed_now)); then
+    # Dropped and fixed within this one check, so no "off" email went out.
+    log "Recovered: dropped off the VPN, auto-fix restored it - $IP ($ORG)"
+    send_mail "[vpn-ipwatch] $host dropped off the VPN; auto-fix restored it ($IP)" "$details"
+  elif [[ "$STATUS" == "VPN" && "$last_status" == "OFFLINE" ]]; then
+    log "Back online on VPN - $IP ($ORG)"
+  elif [[ "$STATUS" == "VPN" && "$IP" != "$last_ip" && -n "$last_ip" && "$ALERT_ON_ANY_CHANGE" == 1 ]]; then
+    log "IP changed: $last_ip -> $IP ($ORG)"
+    send_mail "[vpn-ipwatch] $host IP changed to $IP" "$details"
+  elif [[ -n "$IP" && "$IP" != "$last_ip" ]]; then
+    log "IP now $IP ($ORG) status=$STATUS"
   fi
 
-  printf 'last_ip=%q\nlast_status=%q\n' "$ip" "$status" > "$state"
+  # An off-VPN drop that turns into "no internet" stays OFF-VPN, so you still get
+  # the "back on the VPN" email. Keep last_ip when offline.
+  local save_status="$STATUS"
+  [[ "$STATUS" == "OFFLINE" && "$last_status" == "OFF-VPN" ]] && save_status="OFF-VPN"
+  printf 'last_ip=%q\nlast_status=%q\n' "${IP:-$last_ip}" "$save_status" > "$state"
 }
 
 case "${1:-}" in
   --test-email) send_mail "[vpn-ipwatch] test from $(hostname)" "If you can read this, email alerts work." && echo "Sent." ;;
   --status)
-    ip=$(get_public_ip) || { echo "No public IP"; exit 1; }
-    org=$(get_org "$ip")
-    if on_vpn "$ip" "$org"; then echo "ON VPN: $ip ($org)"; else echo "OFF VPN: $ip ($org) - $REASON"; fi ;;
-  -h|--help) echo "Usage: vpn-ipwatch [--status|--test-email]   (no args = run one check)" ;;
+    check_status
+    case "$STATUS" in
+      VPN)     echo "ON VPN: $IP ($ORG)" ;;
+      OFF-VPN) echo "OFF VPN: ${IP:-no IP} (${ORG:-n/a}) - $REASON" ;;
+      *)       echo "OFFLINE: $REASON" ;;
+    esac
+    [[ -n "$FIX_SCRIPT" ]] && echo "Fix script:  $FIX_SCRIPT"
+    [[ -n "$KILL_SWITCH_CONTAINERS" ]] && echo "Kill switch: $KILL_SWITCH_CONTAINERS"
+    p=$(paused_list); [[ -n "$p" ]] && echo "Paused by vpn-ipwatch: $p"
+    [[ "$STATUS" == "VPN" ]] ;;
+  --test-fix)
+    STATUS="TEST" REASON="manual test (--test-fix)" IP=""
+    mkdir -p "$STATE_DIR"
+    run_fix || { echo "${FIX_RESULT:-FIX_SCRIPT is not set in $CONFIG}"; exit 1; } ;;
+  --resume)
+    RESUMED=()
+    release_kill_switch
+    if ((${#RESUMED[@]})); then echo "Unpaused: ${RESUMED[*]}"; else echo "Nothing to unpause."; fi ;;
+  -h|--help) cat <<'EOF'
+Usage: vpn-ipwatch [option]      (no option = run one check)
+  --status       show VPN status, fix script, kill switch and paused containers
+  --test-email   send a test email
+  --test-fix     run the fix script now
+  --resume       unpause containers that vpn-ipwatch paused (even if still off the VPN)
+EOF
+  ;;
   *) main ;;
 esac

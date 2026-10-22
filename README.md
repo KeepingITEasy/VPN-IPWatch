@@ -10,13 +10,22 @@ Each check decides you're **off the VPN** if any of these is true:
 
 You get one email per drop and one on recovery, never a flood.
 
+Optional extras (v3):
+
+- **Auto-fix:** runs a shell script of your choice the moment you're off the VPN, then re-checks.
+- **Kill switch:** pauses the Docker containers you list while you're off the VPN or offline, and unpauses them once you're back.
+
+When a drop is found, the order is: pause containers → run the fix script → re-check → email.
+
 ## Install
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/vpn-ipwatch.git
+git clone https://github.com/KeepingITEasy/vpn-ipwatch.git
 cd vpn-ipwatch
 sudo bash install.sh
 ```
+
+**Upgrading from v2:** run `git pull` and `sudo bash install.sh` again. Your `/etc/vpn-ipwatch.conf` is kept. The new auto-fix and kill switch settings are added at the end, turned off until you fill them in.
 
 ## Setup
 
@@ -98,6 +107,56 @@ vpn-ipwatch --status
 
 You should see `ON VPN: ...`. **Disconnect** the VPN and run it again. You should see `OFF VPN: ...`, and an alert email arrives within about a minute. Reconnect and you'll get a "back on the VPN" email.
 
+### Step 7 (optional): Auto-fix script
+
+Copy the example, keep the option that matches your VPN (PIA, WireGuard, OpenVPN or a systemd service), and delete the rest:
+
+```bash
+sudo cp /usr/local/share/vpn-ipwatch/fix-vpn.example.sh /usr/local/sbin/fix-vpn.sh
+sudo chmod 755 /usr/local/sbin/fix-vpn.sh
+sudo vi /usr/local/sbin/fix-vpn.sh
+```
+
+Point the config at it (the script can live anywhere):
+
+```
+FIX_SCRIPT="/usr/local/sbin/fix-vpn.sh"
+```
+
+Test it:
+
+```bash
+sudo vpn-ipwatch --test-fix
+```
+
+How it runs:
+
+- Runs as root, so vpn-ipwatch refuses a script that isn't executable or that other users can edit.
+- Runs on the first check that finds you off the VPN, then at most every `FIX_RETRY_INTERVAL` seconds (default 300) until you're back.
+- Stopped after `FIX_TIMEOUT` seconds (default 120). vpn-ipwatch waits `FIX_WAIT` seconds (default 15), then checks again.
+- Gets `VPN_IPWATCH_REASON` and `VPN_IPWATCH_IP` as environment variables. Its output goes to the log.
+- If the fix works within that check, you get one email: "dropped off the VPN; auto-fix restored it".
+- When there's no internet at all but the VPN adapter looks up, it doesn't run unless you set `FIX_WHEN_OFFLINE=1`.
+
+### Step 8 (optional): Kill switch for Docker containers
+
+List the containers to pause, space-separated:
+
+```bash
+docker ps --format '{{.Names}}'
+```
+
+```
+KILL_SWITCH_CONTAINERS="qbittorrent sonarr radarr"
+```
+
+- Paused (`docker pause`) while you're off the VPN **or** offline, and unpaused when you're back on the VPN.
+- Paused containers keep their memory and open files and pick up where they left off. They aren't stopped or restarted.
+- Only containers vpn-ipwatch paused are unpaused. If you paused one yourself, it's left alone.
+- A listed container that starts during an outage is paused at the next check.
+- The list of what it paused is kept in `/var/lib/vpn-ipwatch/paused-containers`, so it survives reboots.
+- To unpause by hand: `sudo vpn-ipwatch --resume`. If you're still off the VPN, the next check pauses them again.
+
 ## Day-to-day commands
 
 ```bash
@@ -111,7 +170,8 @@ To check more or less often, edit `OnUnitActiveSec` in `/etc/systemd/system/vpn-
 ## Notes
 
 - **PIA (Private Internet Access):** leave `VPN_ORG_MATCH` empty. PIA rents servers from many hosting companies, so matching on them causes false alerts. The adapter and ISP checks are enough.
-- **Kill switch:** if your VPN blocks all traffic when it drops, no email can be sent until the connection returns. The drop is still logged.
+- **VPN app kill switch:** if your VPN blocks all traffic when it drops, no email can be sent until the connection returns. The drop is still logged, the fix script still runs and containers are still paused (no internet with the adapter down counts as off the VPN).
+- **Up to a minute of exposure:** the timer checks once a minute, so a container can leak for up to a minute before it's paused. To check more often, lower `OnUnitActiveSec`. Pair this with your VPN app's own kill switch.
 - **IPv4 only.** If your VPN doesn't tunnel IPv6, disable IPv6 or check it separately.
 - **Lookup limit:** ipinfo.io allows about 50,000 free lookups a month. One check a minute uses about 43,000.
 
@@ -119,7 +179,9 @@ To check more or less often, edit `OnUnitActiveSec` in `/etc/systemd/system/vpn-
 
 ```bash
 sudo systemctl disable --now vpn-ipwatch.timer
+sudo vpn-ipwatch --resume   # unpause any containers it paused
 sudo rm /usr/local/bin/vpn-ipwatch /etc/systemd/system/vpn-ipwatch.{service,timer} /etc/vpn-ipwatch.conf
+sudo rm -rf /usr/local/share/vpn-ipwatch
 sudo rm -rf /var/lib/vpn-ipwatch
 ```
 
